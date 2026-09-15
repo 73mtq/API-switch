@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+out/
+*.exe
+*.log
+.DS_Store
+.vscode/
+.idea/
