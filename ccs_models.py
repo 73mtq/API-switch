@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import getpass
 import json
 import os
@@ -16,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -55,6 +56,9 @@ class Model:
     owned_by: str = ""
     context: int = 0  # 接口返回的上下文长度（0 = 未知）
     output: int = 0  # 接口返回的最大输出（0 = 未知）
+    input_modalities: list[str] = field(default_factory=list)
+    reasoning_levels: list[str] = field(default_factory=list)
+    default_reasoning_level: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -182,6 +186,16 @@ def _pick_int(item: dict[str, Any], keys: tuple[str, ...]) -> int:
     return 0
 
 
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, dict):
+        return [str(k) for k, enabled in value.items() if enabled]
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v]
+    return []
+
+
 def parse_models_response(payload: Any) -> list[Model]:
     if not isinstance(payload, dict):
         return []
@@ -208,6 +222,13 @@ def parse_models_response(payload: Any) -> list[Model]:
         if not mid or mid in seen:
             continue
         seen.add(mid)
+        capabilities = item.get("capabilities")
+        capabilities = capabilities if isinstance(capabilities, dict) else {}
+        input_caps = capabilities.get("input")
+        variants = item.get("variants")
+        reasoning_levels = _string_list(item.get("reasoning_levels"))
+        if not reasoning_levels and isinstance(variants, dict):
+            reasoning_levels = list(variants)
         models.append(
             Model(
                 id=mid,
@@ -216,6 +237,11 @@ def parse_models_response(payload: Any) -> list[Model]:
                 owned_by=str(item.get("owned_by") or item.get("ownedBy") or ""),
                 context=_pick_int(item, CONTEXT_KEYS),
                 output=_pick_int(item, OUTPUT_KEYS),
+                input_modalities=_string_list(item.get("input_modalities") or input_caps),
+                reasoning_levels=reasoning_levels,
+                default_reasoning_level=str(
+                    item.get("default_reasoning_level") or item.get("defaultReasoningLevel") or ""
+                ),
             )
         )
     models.sort(key=lambda m: m.id)
@@ -394,8 +420,25 @@ def backup_db(db_path: Path = DB_PATH) -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     target = BACKUP_DIR / f"cc-switch.db.bak-{stamp}"
-    shutil.copy2(db_path, target)
+    src = open_ro(db_path)
+    dst = sqlite3.connect(str(target))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
     return target
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def build_model_picker(
@@ -412,8 +455,60 @@ def build_model_picker(
     return {"options": options, "replaceBuiltInOptions": bool(replace_builtin)}
 
 
+def _catalog_entries(catalog: Any) -> list[dict[str, Any]]:
+    if isinstance(catalog, dict):
+        catalog = catalog.get("models")
+    if not isinstance(catalog, list):
+        return []
+    return [copy.deepcopy(item) for item in catalog if isinstance(item, dict)]
+
+
+def merge_json_entries(
+    existing: Any,
+    incoming: Any,
+    *,
+    key: str,
+    merge: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    existing_entries = _catalog_entries(existing)
+    incoming_entries = _catalog_entries(incoming)
+    existing_ids = {str(item.get(key) or "") for item in existing_entries}
+    existing_ids.discard("")
+    incoming_ids = {str(item.get(key) or "") for item in incoming_entries}
+    incoming_ids.discard("")
+
+    if not merge:
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in incoming_entries:
+            ident = str(item.get(key) or "")
+            if not ident or ident in seen:
+                continue
+            out.append(copy.deepcopy(item))
+            seen.add(ident)
+        return out, {"added": len(seen), "preserved": 0}
+
+    out = existing_entries
+    seen = set(existing_ids)
+    added = 0
+    for item in incoming_entries:
+        ident = str(item.get(key) or "")
+        if not ident or ident in seen:
+            continue
+        out.append(copy.deepcopy(item))
+        seen.add(ident)
+        added += 1
+    preserved = len(incoming_ids & existing_ids)
+    return out, {"added": added, "preserved": preserved}
+
+
 def build_codex_catalog(
-    models: list[Model], template: dict[str, Any] | None = None, context: int = 0
+    models: list[Model],
+    template: dict[str, Any] | None = None,
+    context: int = 0,
+    *,
+    existing: Any = None,
+    merge: bool = False,
 ) -> dict[str, Any]:
     base = template or {
         "context_window": 200000,
@@ -438,7 +533,33 @@ def build_codex_catalog(
             entry["context_window"] = ctx
             entry["max_context_window"] = ctx
         entries.append(entry)
-    return {"models": entries}
+    merged, _stats = merge_json_entries(existing, entries, key="slug", merge=merge)
+    return {"models": merged}
+
+
+def build_codex_model_catalog(
+    models: list[Model],
+    *,
+    existing: Any = None,
+    merge: bool = False,
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    for m in models:
+        entry: dict[str, Any] = {
+            "model": m.id,
+            "displayName": m.display_name or m.id,
+        }
+        if m.context:
+            entry["contextWindow"] = int(m.context)
+        if m.input_modalities:
+            entry["inputModalities"] = list(m.input_modalities)
+        if m.reasoning_levels:
+            entry["reasoningLevels"] = list(m.reasoning_levels)
+        if m.default_reasoning_level:
+            entry["defaultReasoningLevel"] = m.default_reasoning_level
+        entries.append(entry)
+    merged, _stats = merge_json_entries(existing, entries, key="model", merge=merge)
+    return {"models": merged}
 
 
 def _set_toml_top_level(config: str, key: str, value: str) -> str:
@@ -714,57 +835,106 @@ def apply_codex(
     provider_id: str | None = None,
     *,
     context: int = 0,
+    merge: bool = False,
     catalog_path: Path = CODEX_CATALOG,
     db_path: Path = DB_PATH,
     do_backup: bool = True,
 ) -> dict[str, Any]:
+    existing_catalog: dict[str, Any] = {}
     template: dict[str, Any] | None = None
     if catalog_path.exists():
         try:
-            existing = json.loads(catalog_path.read_text(encoding="utf-8"))
-            if isinstance(existing.get("models"), list) and existing["models"]:
-                template = existing["models"][0]
+            loaded = json.loads(catalog_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing_catalog = loaded
+            if isinstance(existing_catalog.get("models"), list) and existing_catalog["models"]:
+                template = existing_catalog["models"][0]
         except Exception:
-            template = None
+            existing_catalog = {}
 
-    catalog = build_codex_catalog(models, template, context=context)
-    backups: list[str] = []
-    if do_backup and catalog_path.exists():
-        backups.append(str(backup_file(catalog_path)))
-
-    catalog_path.parent.mkdir(parents=True, exist_ok=True)
-    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    db_backup = None
+    provider: dict[str, Any] | None = None
+    config: dict[str, Any] | None = None
+    existing_card: Any = None
     if provider_id:
         provider = get_provider("codex", provider_id, db_path)
         if not provider:
             raise ValueError(f"找不到 Codex 供应商卡：{provider_id}")
-        config = json.loads(provider["settings_config"])
+        try:
+            config = json.loads(provider["settings_config"] or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Codex 供应商卡配置不是有效 JSON：{exc}") from exc
+        existing_card = config.get("modelCatalog")
+
+    catalog = build_codex_catalog(
+        models,
+        template,
+        context=context,
+        existing=existing_catalog,
+        merge=merge,
+    )
+    card_catalog = build_codex_model_catalog(
+        models,
+        existing=existing_card,
+        merge=merge,
+    ) if provider_id else None
+
+    selected_ids = {m.id for m in models if m.id}
+    existing_card_ids = {
+        str(item.get("model") or "")
+        for item in _catalog_entries(existing_card)
+    }
+    existing_card_ids.discard("")
+    existing_catalog_ids = {
+        str(item.get("slug") or "")
+        for item in _catalog_entries(existing_catalog)
+    }
+    existing_catalog_ids.discard("")
+    base_ids = existing_card_ids if provider_id and existing_card_ids else existing_catalog_ids
+    preserved = len(selected_ids & base_ids) if merge else 0
+    added = len(selected_ids - base_ids) if merge else len(selected_ids)
+
+    catalog_backup: Path | None = None
+    if do_backup and catalog_path.exists():
+        catalog_backup = backup_file(catalog_path)
+
+    db_backup: Path | None = None
+    if provider_id and config is not None:
         text = str(config.get("config") or "")
-        new_text = _set_toml_top_level(text, "model_catalog_json", catalog_path.name)
-        if new_text != text:
-            config["config"] = new_text
-            if do_backup:
-                db_backup = backup_db(db_path)
-            conn = open_rw(db_path)
-            try:
-                with conn:
-                    conn.execute(
-                        "UPDATE providers SET settings_config=? WHERE app_type=? AND id=?",
-                        (json.dumps(config, ensure_ascii=False), "codex", provider_id),
-                    )
-            finally:
-                conn.close()
+        config["config"] = _set_toml_top_level(text, "model_catalog_json", catalog_path.name)
+        if card_catalog is not None:
+            config["modelCatalog"] = card_catalog
+        if do_backup:
+            db_backup = backup_db(db_path)
+        conn = open_rw(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE providers SET settings_config=? WHERE app_type=? AND id=?",
+                    (json.dumps(config, ensure_ascii=False), "codex", provider_id),
+                )
+        finally:
+            conn.close()
+
+    write_text_atomic(
+        catalog_path,
+        json.dumps(catalog, ensure_ascii=False, indent=2),
+    )
 
     return {
         "ok": True,
         "mode": "codex",
         "providerId": provider_id,
+        "provider": provider["name"] if provider else None,
         "catalog": str(catalog_path),
-        "backup": backups[0] if backups else (str(db_backup) if db_backup else None),
+        "backup": str(db_backup) if db_backup else (str(catalog_backup) if catalog_backup else None),
         "dbBackup": str(db_backup) if db_backup else None,
+        "catalogBackup": str(catalog_backup) if catalog_backup else None,
         "rows": len(catalog["models"]),
+        "catalogRows": len(catalog["models"]),
+        "cardRows": len(card_catalog["models"]) if card_catalog else 0,
+        "added": added,
+        "preserved": preserved,
+        "merged": merge,
     }
 
 
@@ -977,7 +1147,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     elif args.mode == "opencode":
         res = apply_opencode(args.provider, chosen, merge=args.merge)
     elif args.mode == "codex":
-        res = apply_codex(chosen, args.provider)
+        res = apply_codex(chosen, args.provider, merge=args.merge)
     else:
         res = apply_fanout(args.provider, chosen, app_type=args.app, fill_roles=not args.no_fill_roles)
     print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1021,7 +1191,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--pick", default=None)
     a.add_argument("--pick-file", default=None)
     a.add_argument("--append", action="store_true", help="保留内置模型行")
-    a.add_argument("--merge", action="store_true", help="OpenCode：合并到已有模型列表")
+    a.add_argument("--merge", action="store_true", help="OpenCode / Codex：合并到已有模型列表")
     a.add_argument("--discovery", action="store_true", help="同时开启网关模型发现")
     a.add_argument("--no-fill-roles", action="store_true")
     a.add_argument("--dry-run", action="store_true")

@@ -73,7 +73,7 @@ class App(tk.Tk):
         self.picked: set[int] = set()
         self.visible: list[int] = []
         self.provider_ids: list[str] = []
-        self.last_backup: str | None = None
+        self.last_backups: list[tuple[str, str]] = []
         self.q: queue.Queue = queue.Queue()
 
         self._fonts()
@@ -510,7 +510,11 @@ class App(tk.Tk):
         self.after(8000, self._refresh_status)
 
     def _set_status(self, running: bool) -> None:
-        if running:
+        codex_hot = self.mode.get() == "list" and self.app.get() == "codex"
+        if running and codex_hot:
+            self.status.configure(text="● CC Switch 正在运行 · Codex 可热更新", fg=GREEN)
+            self.apply_btn.configure(state="normal")
+        elif running:
             self.status.configure(text="● CC Switch 正在运行 · 请先退出再写入", fg=RED)
             self.apply_btn.configure(state="disabled")
         else:
@@ -646,7 +650,7 @@ class App(tk.Tk):
             state="normal" if (m == "list" and app == "claude") else "disabled"
         )
         self.opt_merge.configure(
-            state="normal" if (m == "list" and app in ("opencode",)) else "disabled"
+            state="normal" if (m == "list" and app in ("opencode", "codex")) else "disabled"
         )
         self.ctx_entry.configure(state="normal" if (m == "list" and app in ("opencode", "codex")) else "disabled")
         self.out_entry.configure(state="normal" if (m == "list" and app == "opencode") else "disabled")
@@ -753,10 +757,23 @@ class App(tk.Tk):
 
     def _after_apply(self, res: dict) -> None:
         self.logln("写入成功：" + res.get("summary", ""))
-        backup = res.get("backup") or res.get("dbBackup")
-        if backup:
-            self.last_backup = backup
-            self.backup_lbl.configure(text="上次备份：" + backup)
+        backups: list[tuple[str, str]] = []
+        if res.get("dbBackup"):
+            backups.append((str(res["dbBackup"]), "db"))
+        if res.get("catalogBackup"):
+            backups.append((str(res["catalogBackup"]), "catalog"))
+        if not backups and res.get("backup"):
+            target = "catalog" if res.get("mode") == "codex" else "db"
+            backups.append((str(res["backup"]), target))
+        if backups:
+            self.last_backups = backups
+            labels = [
+                path.replace("\\", "/").rsplit("/", 1)[-1]
+                for path, _target in backups
+            ]
+            self.backup_lbl.configure(
+                text="上次备份：" + "；".join(labels)
+            )
             self.undo_btn.configure(state="normal")
         self._refresh_status()
 
@@ -822,7 +839,7 @@ class App(tk.Tk):
             def done(res):
                 self.logln("新建成功：" + res["summary"])
                 if res.get("backup"):
-                    self.last_backup = res["backup"]
+                    self.last_backups = [(str(res["backup"]), "db")]
                     self.undo_btn.configure(state="normal")
                 self.app.set(res["app"])
                 self.sync_mode()
@@ -898,7 +915,7 @@ class App(tk.Tk):
             def done(res):
                 self.logln(res["summary"])
                 if res.get("backup"):
-                    self.last_backup = res["backup"]
+                    self.last_backups = [(str(res["backup"]), "db")]
                     self.undo_btn.configure(state="normal")
                 self.load_providers()
                 win.destroy()
@@ -912,17 +929,17 @@ class App(tk.Tk):
         self._center(win, 620, 440)
 
     def do_rollback(self) -> None:
-        if not self.last_backup:
+        if not self.last_backups:
             return
         if not messagebox.askyesno("回滚", "回滚到上一次写入前的备份？"):
             return
-        backup = self.last_backup
+        backups = list(self.last_backups)
 
         def job():
-            return core.rollback(backup, "db")
+            return [core.rollback(path, target) for path, target in backups]
 
         def done(res):
-            self.logln("已回滚：" + res["restored"])
+            self.logln("已回滚：" + "；".join(item["restored"] for item in res))
             self.undo_btn.configure(state="disabled")
 
         self._work(job, done)
@@ -942,6 +959,9 @@ def _models_from(body: dict) -> list[core.Model]:
                     owned_by=str(item.get("owned_by") or ""),
                     context=int(item.get("context") or 0),
                     output=int(item.get("output") or 0),
+                    input_modalities=list(item.get("input_modalities") or []),
+                    reasoning_levels=list(item.get("reasoning_levels") or []),
+                    default_reasoning_level=str(item.get("default_reasoning_level") or ""),
                 )
             )
     return [m for m in out if m.id]
@@ -976,12 +996,64 @@ def _preview_text(body: dict) -> str:
         return f"把 OpenCode 卡「{prov['name']}」的模型列表{action} {len(built)} 个模型；{note}\n\n" + text
 
     if mode == "list" and app == "codex":
-        catalog = core.build_codex_catalog(models, context=int(body.get("context") or 0))
-        text = json.dumps(
-            {"models": catalog["models"][:2], "…": f"共 {len(catalog['models'])} 条"},
-            ensure_ascii=False, indent=2,
+        pid = body.get("providerId")
+        prov = core.get_provider("codex", pid) if pid else None
+        existing_card = None
+        if prov:
+            try:
+                existing_card = json.loads(prov["settings_config"]).get("modelCatalog")
+            except Exception:
+                existing_card = None
+        existing_catalog = None
+        if core.CODEX_CATALOG.exists():
+            try:
+                existing_catalog = json.loads(core.CODEX_CATALOG.read_text(encoding="utf-8"))
+            except Exception:
+                existing_catalog = None
+        template = None
+        if isinstance(existing_catalog, dict) and existing_catalog.get("models"):
+            template = existing_catalog["models"][0]
+        catalog = core.build_codex_catalog(
+            models,
+            template,
+            context=int(body.get("context") or 0),
+            existing=existing_catalog,
+            merge=bool(body.get("merge")),
         )
-        return f"写入 {core.CODEX_CATALOG}\n\n" + text
+        card_catalog = (
+            core.build_codex_model_catalog(
+                models,
+                existing=existing_card,
+                merge=bool(body.get("merge")),
+            )
+            if prov
+            else {"models": []}
+        )
+        base = existing_card if prov else existing_catalog
+        key = "model" if prov else "slug"
+        incoming = card_catalog if prov else core.build_codex_catalog(
+            models, template, context=int(body.get("context") or 0)
+        )
+        _merged, stats = core.merge_json_entries(
+            base,
+            incoming,
+            key=key,
+            merge=bool(body.get("merge")),
+        )
+        text = json.dumps(
+            {
+                "card.models": card_catalog["models"][:2],
+                "…": f"卡 {len(card_catalog['models'])} 个 / 目录 {len(catalog['models'])} 个",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        action = "合并" if body.get("merge") else "覆盖"
+        target = f"Codex 卡「{prov['name']}」和 " if prov else ""
+        return (
+            f"将{action} {target}模型目录 {core.CODEX_CATALOG}："
+            f"新增 {stats['added']} 个，保留 {stats['preserved']} 个。\n\n" + text
+        )
 
     if mode == "fanout":
         template = core.get_provider(app, body.get("providerId"))
@@ -1020,11 +1092,12 @@ def _apply(body: dict) -> dict:
     models = _models_from(body)
     if not models:
         raise ValueError("没有选择任何模型")
-    if core.cc_switch_running():
-        raise RuntimeError("CC Switch 正在运行，请先完全退出后再写入")
-
     mode = body.get("mode", "list")
     app = body.get("app", "claude")
+    hot_codex = mode == "list" and app == "codex"
+    if core.cc_switch_running() and not hot_codex:
+        raise RuntimeError("CC Switch 正在运行，请先完全退出后再写入")
+
     pid = body.get("providerId")
 
     if mode == "fanout":
@@ -1046,8 +1119,17 @@ def _apply(body: dict) -> dict:
         return res
 
     if app == "codex":
-        res = core.apply_codex(models, pid, context=int(body.get("context") or 0))
-        res["summary"] = f"已把 {res['rows']} 个模型写入 Codex 模型目录 {res['catalog']}"
+        res = core.apply_codex(
+            models,
+            pid,
+            context=int(body.get("context") or 0),
+            merge=bool(body.get("merge")),
+        )
+        action = "合并新增" if res["merged"] else "覆盖写入"
+        res["summary"] = (
+            f"已{action} {res['added']} 个模型，保留 {res['preserved']} 个；"
+            f"Codex 卡与模型目录共 {res['cardRows'] or res['catalogRows']} 个模型"
+        )
         return res
 
     res = core.apply_claude(

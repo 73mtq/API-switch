@@ -36,7 +36,7 @@
    - 数据库：`~/.cc-switch/cc-switch.db`
    - 备份目录：`~/.cc-switch/backups/`
    - Codex 模型目录：`~/.codex/cc-switch-model-catalog.json`
-2. **写入前必须完全退出 CC Switch**（包括托盘图标）。程序每 8 秒检测一次进程，运行时标题栏会红字提示「CC Switch 正在运行」，同时「写入」按钮自动禁用；运行时强行写入会直接报错中止。
+2. Claude / OpenCode 写入前必须完全退出 CC Switch（包括托盘图标）。Codex 模式支持热更新：CC Switch 保持运行、路由端口不断开，程序用短事务同步数据库，再原子替换 Codex 模型目录。
 3. Python 3.10+（Windows）。不需要 `pip install` 任何东西。
 
 ## 运行方式
@@ -99,7 +99,7 @@ python ccs_models.py --help
 | --- | --- | --- |
 | 只显示我选的模型 | Claude + 一张卡模式 | 覆盖内置模型列表，只留你勾选的 |
 | 同时开启网关模型发现 | Claude + 一张卡模式 | 顺手写 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` |
-| 合并到已有模型列表 | OpenCode + 一张卡模式 | 保留卡里原有模型，不覆盖 |
+| 合并到已有模型列表 | OpenCode / Codex + 一张卡模式 | 保留已有模型，只追加缺失项 |
 | 上下文 / 最大输出 | OpenCode（两者）、Codex（仅上下文） | 见[下文](#上下文长度context--最大输出) |
 | 同时填 Sonnet / Opus / Haiku 槽位 | 每个模型一张卡模式 | 一并写 `ANTHROPIC_DEFAULT_*_MODEL` |
 
@@ -116,7 +116,7 @@ python ccs_models.py --help
 | 应用 | 一张卡 + 模型列表 | 每个模型一张卡 |
 | --- | --- | --- |
 | **claude** | 写目标卡的 `modelPicker`（在 CC Switch 里以下拉形式选模型） | 每张卡一个模型，可填 Sonnet/Opus/Haiku 槽位 |
-| **codex** | 写 `~/.codex/cc-switch-model-catalog.json` 模型目录，并给卡挂 `model_catalog_json` | 每张卡一份 TOML 配置，`model` 各不相同 |
+| **codex** | 同时写卡的 `modelCatalog` 和 `~/.codex/cc-switch-model-catalog.json`，并给卡挂 `model_catalog_json` | 每张卡一份 TOML 配置，`model` 各不相同 |
 | **opencode** | 写目标卡 `settings_config` 里的 `models` 列表（含 context/output limit） | 不支持（OpenCode 卡自带模型列表，请用一张卡模式） |
 
 ---
@@ -165,7 +165,7 @@ python ccs_models.py apply --mode claude --provider <provider-id> --pick 1,3,5-9
 | `--mode` | `claude` / `codex` / `opencode` / `fanout` |
 | `--app` | fanout 模式下的应用类型 |
 | `--append` | 保留内置模型行（不覆盖） |
-| `--merge` | OpenCode：合并到已有模型列表 |
+| `--merge` | OpenCode / Codex：合并到已有模型列表 |
 | `--discovery` | 同时开启网关模型发现 |
 | `--pick-file` | 从文件读模型 ID 列表（`#` 开头为注释） |
 
@@ -192,7 +192,7 @@ build.bat
 
 ## 常见问题
 
-**提示「CC Switch 正在运行」** — 完全退出 CC Switch（含托盘）再写入，程序每 8 秒自动复查一次。
+**提示「CC Switch 正在运行」** — Claude / OpenCode 需要完全退出 CC Switch（含托盘）再写入；Codex 会显示「Codex 可热更新」，无需中断路由。
 
 **拉取失败 / 0 个模型** — 看日志里逐个候选地址的原因。常见：端点缺 `/v1`、网关要求特定 UA、鉴权头不对（换「鉴权」下拉）、返回的是嵌套结构（可直接把可用地址填进「models 地址」）。
 
