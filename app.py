@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import queue
 import re
@@ -14,93 +13,35 @@ import sys
 import threading
 import time
 import tkinter as tk
+from functools import partial
 from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
+from typing import Any
 
 import ccs_models as core
+import theme
+from formatting import (
+    DEFAULT_CONTEXT,
+    DEFAULT_OUTPUT,
+    filter_indices,
+    fmt_ctx,
+    parse_tokens,
+    shorten,
+    sort_indices,
+)
+from theme import LEFT_WIDTH, PAGE_PAD, SPACE, THEME_LABELS, enable_dpi_awareness, palette_for
+from widgets import Card, FluentButton, ScrollColumn
+from workflows import apply_payload, preview_summary
 
 if sys.platform == "win32":
     import ctypes
-    import winreg
 
 APP_NAME = "API Switch"
 
-# ---------------------------------------------------------------- 配色
-
-LIGHT = {
-    "bg": "#f3f3f3",
-    "card": "#ffffff",
-    "subtle": "#fafafa",
-    "hover": "#f5f5f5",
-    "border": "#e2e2e2",
-    "divider": "#ececec",
-    "control_border": "#8a8a8a",
-    "button_border": "#c9c9c9",
-    "text": "#1b1b1b",
-    "text2": "#5c5c5c",
-    "text3": "#6f6f6f",
-    "accent": "#0067c0",
-    "accent_hover": "#005a9e",
-    "accent_press": "#004e8c",
-    "accent_text": "#ffffff",
-    "accent_tint": "#e8f1fb",
-    "select": "#d9d9d9",
-    "row_hover": "#f6f6f6",
-    "success": "#0f7b0f",
-    "danger": "#c42b1c",
-    "danger_tint": "#fdf3f2",
-    "disabled_bg": "#f5f5f5",
-    "disabled_border": "#e5e5e5",
-    "disabled_text": "#9a9a9a",
-    "scroll": "#c9c9c9",
-    "scroll_hover": "#a8a8a8",
-}
-
-DARK = {
-    "bg": "#202020",
-    "card": "#2b2b2b",
-    "subtle": "#303030",
-    "hover": "#353535",
-    "border": "#3d3d3d",
-    "divider": "#383838",
-    "control_border": "#8f8f8f",
-    "button_border": "#4f4f4f",
-    "text": "#f2f2f2",
-    "text2": "#c8c8c8",
-    "text3": "#a0a0a0",
-    "accent": "#4cc2ff",
-    "accent_hover": "#6ccfff",
-    "accent_press": "#3ab0ec",
-    "accent_text": "#0b0b0b",
-    "accent_tint": "#16324a",
-    "select": "#3a3a3a",
-    "row_hover": "#323232",
-    "success": "#6ccb5f",
-    "danger": "#ff99a4",
-    "danger_tint": "#3b2526",
-    "disabled_bg": "#2a2a2a",
-    "disabled_border": "#383838",
-    "disabled_text": "#767676",
-    "scroll": "#4d4d4d",
-    "scroll_hover": "#6a6a6a",
-}
-
-SPACE = {"xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24}
-CARD_RADIUS = 8
-CONTROL_RADIUS = 4
-
-PAGE_PAD = 16
-LEFT_WIDTH = 404
-DEFAULT_CONTEXT = 1_000_000
-DEFAULT_OUTPUT = 131_072
-
-UI_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "API-Switch"
+UI_DIR = Path(os.environ.get("CCS_UI_DIR") or (Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "API-Switch"))
 UI_CONFIG = UI_DIR / "ui.json"
 
-THEME_LABELS = (("跟随系统", "system"), ("浅色", "light"), ("深色", "dark"))
-
-_TOKENS_RE = re.compile(r"^(\d+(?:\.\d+)?)([km]?)$")
 _SORTABLE = ("id", "name", "by", "ctx")
 _HEADINGS = (
     ("sel", ""),
@@ -112,81 +53,11 @@ _HEADINGS = (
 )
 
 
-# ---------------------------------------------------------------- 小工具
+# ---------------------------------------------------------------- 配置
 
 
-def _srgb_channel(value: int) -> float:
-    c = value / 255.0
-    if c <= 0.04045:
-        return c / 12.92
-    return ((c + 0.055) / 1.055) ** 2.4
-
-
-def luminance(color: str) -> float:
-    raw = color.lstrip("#")
-    r, g, b = (int(raw[i : i + 2], 16) for i in (0, 2, 4))
-    return 0.2126 * _srgb_channel(r) + 0.7152 * _srgb_channel(g) + 0.0722 * _srgb_channel(b)
-
-
-def contrast_ratio(a: str, b: str) -> float:
-    la, lb = luminance(a), luminance(b)
-    hi, lo = max(la, lb), min(la, lb)
-    return (hi + 0.05) / (lo + 0.05)
-
-
-def parse_tokens(text: str, *, field: str) -> int:
-    raw = (text or "").strip().lower().replace(",", "").replace("_", "")
-    if not raw:
-        raise ValueError(f"{field}不能为空")
-    match = _TOKENS_RE.match(raw)
-    if not match:
-        raise ValueError(f"{field}请填写数字，或 256K / 1M 这样的写法")
-    scale = {"": 1, "k": 1000, "m": 1_000_000}[match.group(2)]
-    value = int(float(match.group(1)) * scale)
-    if value <= 0:
-        raise ValueError(f"{field}必须大于 0")
-    return value
-
-
-def _fmt_ctx(n: int) -> str:
-    n = int(n or 0)
-    if not n:
-        return ""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:g}M"
-    if n >= 1000:
-        return f"{n / 1000:g}K"
-    return str(n)
-
-
-def _shorten(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    head = max(1, limit - 12)
-    return text[:head] + "…" + text[-10:]
-
-
-def _system_theme() -> str:
-    if sys.platform != "win32":
-        return "light"
-    key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
-        value, _kind = winreg.QueryValueEx(key, "AppsUseLightTheme")
-    return "light" if value else "dark"
-
-
-def palette_for(mode: str) -> dict[str, str]:
-    if mode == "light":
-        return dict(LIGHT)
-    if mode == "dark":
-        return dict(DARK)
-    return dict(LIGHT if _system_theme() == "light" else DARK)
-
-
-def _enable_dpi_awareness() -> None:
-    if sys.platform != "win32":
-        return
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+def _backup_label(path: object) -> str:
+    return Path(str(path)).name
 
 
 def load_ui_config(path: Path) -> dict:
@@ -198,302 +69,6 @@ def load_ui_config(path: Path) -> dict:
 def save_ui_config(path: Path, config: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def model_sort_value(model: core.Model, column: str):
-    if column == "id":
-        return model.id.lower()
-    if column == "name":
-        return (model.display_name or "").lower()
-    if column == "by":
-        return (model.owned_by or "").lower()
-    if column == "ctx":
-        return int(getattr(model, "context", 0) or 0)
-    return ""
-
-
-def sort_indices(models: list[core.Model], column: str, descending: bool) -> list[int]:
-    order = list(range(len(models)))
-    order.sort(key=lambda i: (model_sort_value(models[i], column), i), reverse=descending)
-    return order
-
-
-def filter_indices(models: list[core.Model], order: list[int], query: str) -> list[int]:
-    q = (query or "").strip().lower()
-    if not q:
-        return list(order)
-    return [
-        i
-        for i in order
-        if q in models[i].id.lower() or q in (models[i].display_name or "").lower()
-    ]
-
-
-def rounded_rect(canvas: tk.Canvas, x1, y1, x2, y2, radius, **kwargs):
-    r = max(0.0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
-    steps = 6
-    points: list[float] = []
-    centers = (
-        (x2 - r, y1 + r, -90.0),
-        (x2 - r, y2 - r, 0.0),
-        (x1 + r, y2 - r, 90.0),
-        (x1 + r, y1 + r, 180.0),
-    )
-    for cx, cy, start in centers:
-        for i in range(steps + 1):
-            angle = math.radians(start + 90.0 * i / steps)
-            points.append(cx + r * math.cos(angle))
-            points.append(cy + r * math.sin(angle))
-    return canvas.create_polygon(points, **kwargs)
-
-
-# ---------------------------------------------------------------- 自定义部件
-
-
-class FluentButton(tk.Canvas):
-    """圆角按钮：primary / secondary / subtle / danger 四种样式。"""
-
-    def __init__(
-        self,
-        parent,
-        text: str,
-        command,
-        pal: dict[str, str],
-        *,
-        kind: str = "secondary",
-        font: tkfont.Font,
-        height: int = 32,
-        padx: int = 14,
-        bg_role: str = "card",
-        width: int | None = None,
-    ) -> None:
-        self.pal = pal
-        self.kind = kind
-        self.text = text
-        self.command = command
-        self.font = font
-        self._height = height
-        self._padx = padx
-        self._bg_role = bg_role
-        self._width = width or (font.measure(text) + padx * 2)
-        self._enabled = True
-        self._hover = False
-        self._pressed = False
-        self._focused = False
-        super().__init__(
-            parent, width=self._width, height=height, highlightthickness=0, bd=0,
-            bg=pal[bg_role], takefocus=1,
-        )
-        self.bind("<Configure>", self._on_configure)
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
-        self.bind("<ButtonPress-1>", self._on_press)
-        self.bind("<ButtonRelease-1>", self._on_release)
-        self.bind("<FocusIn>", self._on_focus)
-        self.bind("<FocusOut>", self._on_blur)
-        self.bind("<Return>", self._on_key)
-        self.bind("<space>", self._on_key)
-        self._draw()
-
-    # -- 状态 --
-
-    def set_enabled(self, enabled: bool) -> None:
-        if enabled == self._enabled:
-            return
-        self._enabled = enabled
-        if not enabled:
-            self._hover = self._pressed = False
-            self.configure(takefocus=0)
-        else:
-            self.configure(takefocus=1)
-        self._draw()
-
-    def set_text(self, text: str) -> None:
-        if text == self.text:
-            return
-        self.text = text
-        self._width = self.font.measure(text) + self._padx * 2
-        self.configure(width=self._width)
-        self._draw()
-
-    def set_palette(self, pal: dict[str, str]) -> None:
-        self.pal = pal
-        self.configure(bg=pal[self._bg_role])
-        self._draw()
-
-    def invoke(self) -> None:
-        if self._enabled and self.command is not None:
-            self.command()
-
-    # -- 事件 --
-
-    def _on_configure(self, event) -> None:
-        self._width = event.width
-        self._height = event.height
-        self._draw()
-
-    def _on_enter(self, _event) -> None:
-        self._hover = True
-        self._draw()
-
-    def _on_leave(self, _event) -> None:
-        self._hover = self._pressed = False
-        self._draw()
-
-    def _on_press(self, _event) -> None:
-        if not self._enabled:
-            return
-        self._pressed = True
-        self.focus_set()
-        self._draw()
-
-    def _on_release(self, event) -> None:
-        if not self._enabled:
-            return
-        inside = 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height()
-        self._pressed = False
-        self._draw()
-        if inside:
-            self.invoke()
-
-    def _on_focus(self, _event) -> None:
-        self._focused = True
-        self._draw()
-
-    def _on_blur(self, _event) -> None:
-        self._focused = False
-        self._draw()
-
-    def _on_key(self, _event) -> str:
-        self.invoke()
-        return "break"
-
-    # -- 绘制 --
-
-    def _bg_of(self) -> str:
-        if self.kind == "primary":
-            base = self.pal["accent"]
-        elif self.kind == "subtle":
-            base = self.pal[self._bg_role]
-        else:
-            base = self.pal["card"]
-        if not self._enabled:
-            base = self.pal["disabled_bg"]
-        elif self._pressed:
-            base = self.pal["accent_press"] if self.kind == "primary" else self.pal["hover"]
-        elif self._hover:
-            base = self.pal["accent_hover"] if self.kind == "primary" else self.pal["hover"]
-        return base
-
-    def _draw(self) -> None:
-        self.delete("all")
-        p = self.pal
-        w = self._width
-        h = self._height
-        bg = self._bg_of()
-        if self.kind == "primary":
-            fg = p["accent_text"] if self._enabled else p["disabled_text"]
-            border = ""
-        elif self.kind == "danger":
-            fg = p["danger"] if self._enabled else p["disabled_text"]
-            border = p["button_border"] if self._enabled else p["disabled_border"]
-        elif self.kind == "subtle":
-            fg = p["text2"] if self._enabled else p["disabled_text"]
-            border = ""
-        else:
-            fg = p["text"] if self._enabled else p["disabled_text"]
-            border = p["button_border"] if self._enabled else p["disabled_border"]
-        if self._focused and self._enabled:
-            rounded_rect(self, 1, 1, w - 1, h - 1, CONTROL_RADIUS + 1, fill="", outline=p["text"], width=1)
-        self._shape = rounded_rect(
-            self, 2, 2, w - 2, h - 2, CONTROL_RADIUS, fill=bg, outline=border or bg, width=1,
-        )
-        self.create_text(w / 2, h / 2 + 1, text=self.text, fill=fg, font=self.font)
-
-
-class Card(tk.Frame):
-    """带 8px 圆角与 1px 边框的卡片容器，内容放在 .body。"""
-
-    def __init__(self, parent, pal: dict[str, str], *, expand: bool = False) -> None:
-        super().__init__(parent, bg=pal["bg"])
-        self.pal = pal
-        self.expand = expand
-        self.canvas = tk.Canvas(self, bg=pal["bg"], highlightthickness=0, bd=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.body = tk.Frame(self.canvas, bg=pal["card"])
-        self._win = self.canvas.create_window(4, 4, window=self.body, anchor="nw")
-        self._shape = None
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-        if not expand:
-            self.body.bind("<Configure>", self._on_body_configure)
-
-    def _on_canvas_configure(self, event) -> None:
-        self._draw(event.width, event.height)
-        self.canvas.itemconfigure(self._win, width=max(1, event.width - 8))
-        if self.expand:
-            self.canvas.itemconfigure(self._win, height=max(1, event.height - 8))
-
-    def _on_body_configure(self, _event) -> None:
-        self.canvas.configure(height=self.body.winfo_reqheight() + 8)
-
-    def _draw(self, width: int, height: int) -> None:
-        if self._shape is not None:
-            self.canvas.delete(self._shape)
-        self._shape = rounded_rect(
-            self.canvas, 1, 1, max(2, width - 1), max(2, height - 1), CARD_RADIUS,
-            fill=self.pal["card"], outline=self.pal["border"],
-        )
-        self.canvas.tag_lower(self._shape)
-
-    def refresh(self, pal: dict[str, str]) -> None:
-        self.pal = pal
-        self.configure(bg=pal["bg"])
-        self.canvas.configure(bg=pal["bg"])
-        self.body.configure(bg=pal["card"])
-        self._draw(self.canvas.winfo_width(), self.canvas.winfo_height())
-
-
-class ScrollColumn(tk.Frame):
-    """固定宽度、内容超出时出现滚动条的纵向容器。"""
-
-    def __init__(self, parent, pal: dict[str, str], width: int) -> None:
-        super().__init__(parent, bg=pal["bg"], width=width)
-        self.pal = pal
-        self.pack_propagate(False)
-        self.canvas = tk.Canvas(self, bg=pal["bg"], highlightthickness=0, bd=0)
-        self.inner = tk.Frame(self.canvas, bg=pal["bg"])
-        self._win = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
-        self.scroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.scroll.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.inner.bind("<Configure>", self._on_inner)
-        self.canvas.bind("<Configure>", self._on_canvas)
-
-    def _on_inner(self, _event) -> None:
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self._sync_scrollbar()
-
-    def _on_canvas(self, event) -> None:
-        self.canvas.itemconfigure(self._win, width=event.width)
-        self._sync_scrollbar()
-
-    def _sync_scrollbar(self) -> None:
-        box = self.canvas.bbox("all")
-        need = bool(box) and (box[3] - box[1]) > self.canvas.winfo_height() + 2
-        if need and not self.scroll.winfo_ismapped():
-            self.scroll.pack(side="right", fill="y")
-        elif not need and self.scroll.winfo_ismapped():
-            self.scroll.pack_forget()
-
-    def can_scroll(self) -> bool:
-        first, last = self.canvas.yview()
-        return first > 0.0 or last < 1.0
-
-    def refresh(self, pal: dict[str, str]) -> None:
-        self.pal = pal
-        self.configure(bg=pal["bg"])
-        self.canvas.configure(bg=pal["bg"])
-        self.inner.configure(bg=pal["bg"])
 
 
 # ---------------------------------------------------------------- 界面
@@ -538,6 +113,7 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.logln("就绪。填写端点后点「拉取模型列表」。")
+        self.after(50, self._apply_title_bar)
         self.after(120, self._pump)
         self.after(200, self._refresh_status)
         self.after(4000, self._watch_system_theme)
@@ -734,6 +310,16 @@ class App(tk.Tk):
         self.log_text.tag_configure("ok", foreground=self.pal["success"])
         self.log_text.tag_configure("err", foreground=self.pal["danger"])
         self._draw_status_dot()
+        self._apply_title_bar()
+
+    def _apply_title_bar(self) -> None:
+        if sys.platform != "win32":
+            return
+        dark = 1 if self.pal["bg"] == theme.DARK["bg"] else 0
+        hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, 20, ctypes.byref(ctypes.c_int(dark)), ctypes.sizeof(ctypes.c_int),
+        )
 
     def _prune_registry(self) -> None:
         self._themed = [(widget, roles) for widget, roles in self._themed if widget.winfo_exists()]
@@ -772,11 +358,18 @@ class App(tk.Tk):
 
         self._build_log()
         self.bind_all("<MouseWheel>", self._on_wheel)
-        self.bind_all("<Control-Return>", lambda _e: self.do_apply())
-        self.bind_all("<Control-f>", lambda _e: self.search.focus_set())
-        self.bind_all("<Control-F>", lambda _e: self.search.focus_set())
-        self.bind_all("<F5>", lambda _e: self._reload())
+        self.bind_all("<Control-Return>", lambda _e: self._guard_shortcut(self.do_apply))
+        self.bind_all("<Control-f>", lambda _e: self._guard_shortcut(self.search.focus_set))
+        self.bind_all("<Control-F>", lambda _e: self._guard_shortcut(self.search.focus_set))
+        self.bind_all("<F5>", lambda _e: self._guard_shortcut(self._reload))
         self.sync_mode()
+
+    def _modal_open(self) -> bool:
+        return self.grab_current() is not None
+
+    def _guard_shortcut(self, action) -> None:
+        if not self._modal_open():
+            action()
 
     def _reload(self) -> None:
         self.load_providers()
@@ -883,7 +476,9 @@ class App(tk.Tk):
         body.pack(fill="x", padx=PAGE_PAD, pady=(4, 14))
         body.columnconfigure(1, weight=1)
 
-        ttk.Label(body, text="模式", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        ttk.Label(body, text="模式", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(6, 2)
+        )
         self.mode = tk.StringVar(value="list")
         mode_row = self._frame(body, "card")
         mode_row.grid(row=1, column=0, columnspan=2, sticky="w")
@@ -892,7 +487,9 @@ class App(tk.Tk):
         ttk.Radiobutton(mode_row, text="每个模型一张卡", value="fanout", variable=self.mode,
                         command=self.sync_mode).pack(side="left")
 
-        ttk.Label(body, text="目标", style="Section.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 2))
+        ttk.Label(body, text="目标", style="Section.TLabel").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(12, 2)
+        )
         self.app = ttk.Combobox(body, state="readonly", values=["claude", "codex", "opencode"])
         self.app.set("claude")
         self.app.bind("<<ComboboxSelected>>", lambda _e: self.sync_mode())
@@ -902,13 +499,19 @@ class App(tk.Tk):
         provider_row = self._frame(body, "card")
         provider_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         provider_row.columnconfigure(1, weight=1)
-        ttk.Label(provider_row, text="供应商卡", style="Form.TLabel").grid(row=0, column=0, sticky="w", padx=(0, SPACE["sm"]))
+        ttk.Label(provider_row, text="供应商卡", style="Form.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, SPACE["sm"])
+        )
         self.provider = ttk.Combobox(provider_row, state="readonly")
         self.provider.grid(row=0, column=1, sticky="ew")
         self.provider.bind("<<ComboboxSelected>>", lambda _e: self._update_action_state())
-        self.new_btn = self._button(provider_row, "新建", self.new_card_dialog, kind="subtle", height=26, padx=8, bg_role="card")
+        self.new_btn = self._button(
+            provider_row, "新建", self.new_card_dialog, kind="subtle", height=26, padx=8, bg_role="card",
+        )
         self.new_btn.grid(row=0, column=2, padx=(6, 0))
-        self.del_btn = self._button(provider_row, "删除", self.delete_card_dialog, kind="subtle", height=26, padx=8, bg_role="card")
+        self.del_btn = self._button(
+            provider_row, "删除", self.delete_card_dialog, kind="subtle", height=26, padx=8, bg_role="card",
+        )
         self.del_btn.grid(row=0, column=3, padx=(4, 0))
 
         self.prefix_var = tk.StringVar()
@@ -921,17 +524,29 @@ class App(tk.Tk):
         self.prefix_hint = ttk.Label(prefix_row, text="仅「每个模型一张卡」生效", style="Hint.TLabel")
         self.prefix_hint.grid(row=0, column=1, sticky="w", padx=(SPACE["sm"], 0))
 
-        ttk.Label(body, text="选项", style="Section.TLabel").grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 2))
+        ttk.Label(body, text="选项", style="Section.TLabel").grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(12, 2)
+        )
         self.replace = tk.BooleanVar(value=True)
         self.disc = tk.BooleanVar(value=False)
         self.merge = tk.BooleanVar(value=False)
         self.roles = tk.BooleanVar(value=True)
-        self.opt_replace, self.hint_replace = self._option_row(body, 7, "只显示我选的模型", self.replace, "仅 claude + 一张卡")
-        self.opt_disc, self.hint_disc = self._option_row(body, 8, "同时开启网关模型发现", self.disc, "仅 claude + 一张卡")
-        self.opt_merge, self.hint_merge = self._option_row(body, 9, "合并到已有模型列表", self.merge, "仅 codex / opencode + 一张卡")
-        self.opt_roles, self.hint_roles = self._option_row(body, 10, "同时填 Sonnet / Opus / Haiku 槽位", self.roles, "仅「每个模型一张卡」")
+        self.opt_replace, self.hint_replace = self._option_row(
+            body, 7, "只显示我选的模型", self.replace, "仅 claude + 一张卡"
+        )
+        self.opt_disc, self.hint_disc = self._option_row(
+            body, 8, "同时开启网关模型发现", self.disc, "仅 claude + 一张卡"
+        )
+        self.opt_merge, self.hint_merge = self._option_row(
+            body, 9, "合并到已有模型列表", self.merge, "仅 codex / opencode + 一张卡"
+        )
+        self.opt_roles, self.hint_roles = self._option_row(
+            body, 10, "同时填 Sonnet / Opus / Haiku 槽位", self.roles, "仅「每个模型一张卡」"
+        )
 
-        ttk.Label(body, text="参数", style="Section.TLabel").grid(row=11, column=0, columnspan=2, sticky="w", pady=(12, 2))
+        ttk.Label(body, text="参数", style="Section.TLabel").grid(
+            row=11, column=0, columnspan=2, sticky="w", pady=(12, 2)
+        )
         self.ctx_var = tk.StringVar(value=str(DEFAULT_CONTEXT))
         self.ctx_var.trace_add("write", lambda *_: self._validate_params())
         self.ctx_entry = ttk.Entry(body, textvariable=self.ctx_var, width=12)
@@ -939,7 +554,9 @@ class App(tk.Tk):
         ctx_row = self._frame(body, "card")
         ctx_row.grid(row=12, column=1, sticky="ew", pady=(6, 0))
         self.ctx_entry.pack(in_=ctx_row, side="left")
-        self.max_btn = self._button(ctx_row, "取接口最大值", self._fill_max_ctx, kind="subtle", height=26, padx=8, bg_role="card")
+        self.max_btn = self._button(
+            ctx_row, "取接口最大值", self._fill_max_ctx, kind="subtle", height=26, padx=8, bg_role="card",
+        )
         self.max_btn.pack(side="left", padx=(SPACE["sm"], 0))
         self.ctx_err = ttk.Label(body, text="", style="Error.TLabel")
         self.ctx_err.grid(row=13, column=1, sticky="w")
@@ -978,7 +595,9 @@ class App(tk.Tk):
         backup_row.grid(row=20, column=0, columnspan=2, sticky="ew", pady=(SPACE["sm"], 0))
         self.backup_lbl = ttk.Label(backup_row, text="", style="Hint.TLabel")
         self.backup_lbl.pack(side="left")
-        self.open_backup_btn = self._button(backup_row, "打开备份目录", self._open_backup_dir, kind="subtle", height=24, padx=6, bg_role="card")
+        self.open_backup_btn = self._button(
+            backup_row, "打开备份目录", self._open_backup_dir, kind="subtle", height=24, padx=6, bg_role="card",
+        )
         self.open_backup_btn.pack(side="right")
 
     def _option_row(self, parent, row: int, text: str, var: tk.BooleanVar, hint: str):
@@ -1001,7 +620,9 @@ class App(tk.Tk):
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_changed)
         self.search = ttk.Entry(head, textvariable=self.search_var, width=24)
-        self.search_clear = self._button(head, "清除", self._clear_search, kind="subtle", height=26, padx=8, bg_role="card")
+        self.search_clear = self._button(
+            head, "清除", self._clear_search, kind="subtle", height=26, padx=8, bg_role="card",
+        )
         self.search_clear.pack(side="right")
         self.search.pack(side="right", padx=(0, SPACE["sm"]))
         self._attach_placeholder(self.search, self.search_var, "搜索模型 ID 或名称")
@@ -1017,7 +638,9 @@ class App(tk.Tk):
         info.pack(fill="x", padx=PAGE_PAD, pady=(SPACE["sm"], 0))
         self.count = ttk.Label(info, text="共 0 个模型", style="Chip.TLabel")
         self.count.pack(side="left")
-        self.fetch_info = ttk.Label(info, text="单击勾选 · 空格切换 · Ctrl+C 复制已选 ID · Ctrl+Enter 写入", style="Hint.TLabel")
+        self.fetch_info = ttk.Label(
+            info, text="单击勾选 · 空格切换 · Ctrl+C 复制已选 ID · Ctrl+Enter 写入", style="Hint.TLabel",
+        )
         self.fetch_info.pack(side="right")
 
         holder = self._frame(card.body, "card", highlightthickness=1, highlightbackground=self.pal["border"])
@@ -1028,7 +651,7 @@ class App(tk.Tk):
         for column, title in _HEADINGS:
             self.tree.heading(column, text=title)
             if column in _SORTABLE:
-                self.tree.heading(column, command=lambda c=column: self._sort_by(c))
+                self.tree.heading(column, command=partial(self._sort_by, column))
         self.tree.column("sel", width=40, anchor="center", stretch=False)
         self.tree.column("no", width=52, anchor="center", stretch=False)
         self.tree.column("id", width=360, minwidth=180)
@@ -1064,7 +687,9 @@ class App(tk.Tk):
         head = self._frame(card.body, "card")
         head.pack(fill="x", padx=PAGE_PAD, pady=(10, 6))
         ttk.Label(head, text="日志", style="CardTitle.TLabel").pack(side="left")
-        self.log_toggle_btn = self._button(head, "收起", self._toggle_log, kind="subtle", height=26, padx=8, bg_role="card")
+        self.log_toggle_btn = self._button(
+            head, "收起", self._toggle_log, kind="subtle", height=26, padx=8, bg_role="card",
+        )
         self.log_toggle_btn.pack(side="right")
         self._button(head, "清空", self._clear_log, kind="subtle", height=26, padx=8, bg_role="card").pack(
             side="right", padx=(0, SPACE["xs"])
@@ -1098,7 +723,9 @@ class App(tk.Tk):
         if not match:
             width = min(1200, max(940, self.winfo_screenwidth() - 160))
             height = min(830, max(620, self.winfo_screenheight() - 140))
-            self.geometry(f"{width}x{height}+{(self.winfo_screenwidth() - width) // 2}+{max(0, (self.winfo_screenheight() - height) // 3)}")
+            x = (self.winfo_screenwidth() - width) // 2
+            y = max(0, (self.winfo_screenheight() - height) // 3)
+            self.geometry(f"{width}x{height}+{x}+{y}")
             return
         width, height, x, y = (int(match.group(i)) for i in range(1, 5))
         width = max(940, min(width, self.winfo_screenwidth()))
@@ -1292,10 +919,14 @@ class App(tk.Tk):
         self.prog.start(14)
         lines: list[str] = []
 
+        def log_line(message: str) -> None:
+            lines.append(message)
+            self.q.put(("log", core.redact(message, [key] if key else []), None))
+
         def job() -> list[core.Model]:
             models, _logs = core.fetch_models(
                 base, key, is_full_url=full, models_url=murl, user_agent=ua, api_format=fmt,
-                log=lambda m: (lines.append(m), self.q.put(("log", core.redact(m, [key] if key else []), None))),
+                log=log_line,
             )
             core.save_models(models)
             return models
@@ -1309,14 +940,15 @@ class App(tk.Tk):
             self.render()
             hit = next((line[4:] for line in reversed(lines) if line.startswith("GET ")), "")
             self.fetch_info.configure(
-                text=f"命中 {_shorten(hit, 56)} · {len(models)} 个模型" if hit else f"{len(models)} 个模型"
+                text=f"命中 {shorten(hit, 56)} · {len(models)} 个模型" if hit else f"{len(models)} 个模型"
             )
             self.logln(f"拉取完成：共 {len(models)} 个模型", "ok")
             known = [int(getattr(m, "context", 0) or 0) for m in models]
             known = [n for n in known if n > 0]
             if known:
-                self.ctx_var.set(str(max(known)))
-                self.logln(f"接口返回了 {len(known)} 个模型的上下文，已按最大值 {max(known)}（{_fmt_ctx(max(known))}）填入")
+                top = max(known)
+                self.ctx_var.set(str(top))
+                self.logln(f"接口返回了 {len(known)} 个模型的上下文，已按最大值 {top}（{fmt_ctx(top)}）填入")
             else:
                 self.logln("接口没返回上下文长度，可在「写入目标」里手动填（默认 1M / 128K）")
             self._update_action_state()
@@ -1353,7 +985,7 @@ class App(tk.Tk):
                     model.id,
                     model.display_name,
                     model.owned_by,
-                    _fmt_ctx(model.context),
+                    fmt_ctx(model.context),
                 ),
             )
         self._refresh_headings()
@@ -1381,7 +1013,7 @@ class App(tk.Tk):
                 model.id,
                 model.display_name,
                 model.owned_by,
-                _fmt_ctx(model.context),
+                fmt_ctx(model.context),
             ),
         )
 
@@ -1395,12 +1027,15 @@ class App(tk.Tk):
         total = len(self.models)
         shown = len(self.visible)
         known = sum(1 for m in self.models if getattr(m, "context", 0))
-        text = f"已选 {len(self.picked)} · 显示 {shown} / {total} 个模型" if shown != total else f"已选 {len(self.picked)} · 共 {total} 个模型"
+        if shown != total:
+            text = f"已选 {len(self.picked)} · 显示 {shown} / {total} 个模型"
+        else:
+            text = f"已选 {len(self.picked)} · 共 {total} 个模型"
         if known:
             text += f" · 接口给出 {known} 个上下文"
         focus = self.tree.focus()
         if focus and self.tree.exists(focus):
-            text += f" · 当前 {_shorten(self.models[int(focus)].id, 46)}"
+            text += f" · 当前 {shorten(self.models[int(focus)].id, 46)}"
         self.count.configure(text=text)
 
     def _sync_empty(self) -> None:
@@ -1445,6 +1080,7 @@ class App(tk.Tk):
         if shift and self._anchor is not None:
             low, high = sorted((self._anchor, index))
             target = index not in self.picked
+            visible = set(self.visible)
             for other in self.visible:
                 if low <= other <= high:
                     if target:
@@ -1452,7 +1088,7 @@ class App(tk.Tk):
                     else:
                         self.picked.discard(other)
             for other in range(low, high + 1):
-                if other in self.visible:
+                if other in visible:
                     self._refresh_row(other)
         else:
             if index in self.picked:
@@ -1552,7 +1188,7 @@ class App(tk.Tk):
             return self.provider.get().split("（")[0]
         return "（未选择）"
 
-    def sync_mode(self) -> None:
+    def sync_mode(self, select_provider: str | None = None) -> None:
         mode, app = self.mode.get(), self.app.get()
         if mode == "fanout" and app == "opencode":
             self.app.set("claude")
@@ -1565,15 +1201,16 @@ class App(tk.Tk):
         self._set_enabled(self.opt_roles, mode == "fanout")
         self._set_enabled(self.ctx_entry, list_mode and app in ("opencode", "codex"))
         self._set_enabled(self.out_entry, list_mode and app == "opencode")
+        self.max_btn.set_enabled(list_mode and app in ("opencode", "codex"))
         self._set_enabled(self.prefix, mode == "fanout")
         self._validate_params()
-        self.load_providers()
+        self.load_providers(select_provider)
         self._set_status(self._cc_running)
 
-    def _set_enabled(self, widget: ttk.Widget, enabled: bool) -> None:
+    def _set_enabled(self, widget: Any, enabled: bool) -> None:
         widget.configure(state="normal" if enabled else "disabled")
 
-    def load_providers(self) -> None:
+    def load_providers(self, select_id: str | None = None) -> None:
         app = self.app.get()
         previous = self._current_provider_id()
 
@@ -1587,8 +1224,9 @@ class App(tk.Tk):
         def done(rows: list[dict]) -> None:
             self.provider_ids = [row["id"] for row in rows]
             self.provider.configure(values=[f"{row['name']}（{row['id']}）" for row in rows])
-            if previous in self.provider_ids:
-                self.provider.current(self.provider_ids.index(previous))
+            target = select_id or previous
+            if target in self.provider_ids:
+                self.provider.current(self.provider_ids.index(target))
             elif self.provider_ids:
                 self.provider.current(0)
             else:
@@ -1596,10 +1234,6 @@ class App(tk.Tk):
             self._update_action_state()
 
         self._work(job, done)
-
-    def _select_provider(self, provider_id: str) -> None:
-        if provider_id in self.provider_ids:
-            self.provider.current(self.provider_ids.index(provider_id))
 
     def _validate_params(self) -> None:
         mode, app = self.mode.get(), self.app.get()
@@ -1637,7 +1271,7 @@ class App(tk.Tk):
             return
         top = max(known)
         self.ctx_var.set(str(top))
-        self.logln(f"已取接口返回的最大上下文：{top}（{_fmt_ctx(top)}）")
+        self.logln(f"已取接口返回的最大上下文：{top}（{fmt_ctx(top)}）")
 
     def _action_reason(self) -> str:
         if self._busy:
@@ -1663,7 +1297,7 @@ class App(tk.Tk):
         self.reason.configure(text=reason)
         self.apply_btn.set_enabled(not reason)
         self.preview_btn.set_enabled(bool(self.picked) and not self._busy)
-        self.undo_btn.set_enabled(bool(self.last_backups) and not self._busy)
+        self.undo_btn.set_enabled(bool(self.last_backups) and not self._busy and not self._cc_running)
         self.new_btn.set_enabled(not self._busy)
         self.del_btn.set_enabled(not self._busy)
         self.fetch_btn.set_enabled(not self._busy and not self._fetching)
@@ -1672,9 +1306,12 @@ class App(tk.Tk):
         return [self.models[i] for i in sorted(self.picked)]
 
     def payload(self) -> dict:
+        mode, app = self.mode.get(), self.app.get()
+        ctx_active = mode == "list" and app in ("opencode", "codex")
+        out_active = mode == "list" and app == "opencode"
         return {
-            "mode": self.mode.get(),
-            "app": self.app.get(),
+            "mode": mode,
+            "app": app,
             "providerId": self._current_provider_id(),
             "models": [m.to_dict() for m in self.chosen()],
             "replaceBuiltIn": self.replace.get(),
@@ -1682,8 +1319,8 @@ class App(tk.Tk):
             "merge": self.merge.get(),
             "fillRoles": self.roles.get(),
             "namePrefix": self.prefix_var.get().strip(),
-            "context": parse_tokens(self.ctx_var.get(), field="上下文长度"),
-            "output": parse_tokens(self.out_var.get(), field="最大输出"),
+            "context": parse_tokens(self.ctx_var.get(), field="上下文长度") if ctx_active else DEFAULT_CONTEXT,
+            "output": parse_tokens(self.out_var.get(), field="最大输出") if out_active else DEFAULT_OUTPUT,
         }
 
     # ---------- 预览与写入 ----------
@@ -1696,7 +1333,7 @@ class App(tk.Tk):
             messagebox.showwarning("参数有误", "请先修正「参数」里的输入", parent=self)
             return
         body = self.payload()
-        self._work(lambda: _preview_summary(body), self._show_preview)
+        self._work(lambda: preview_summary(body), self._show_preview)
 
     def _show_preview(self, text: str) -> None:
         win, outer = self._dialog("变更预览", 720, 580)
@@ -1722,7 +1359,11 @@ class App(tk.Tk):
         self._button(bar, "复制内容", lambda: self._copy_text(text), kind="subtle", height=30).pack(
             side="right", padx=(0, SPACE["sm"])
         )
-        self._button(bar, "写入并备份", lambda: (win.destroy(), self.do_apply()), kind="primary", height=30).pack(
+        def apply_now() -> None:
+            win.destroy()
+            self.do_apply()
+
+        self._button(bar, "写入并备份", apply_now, kind="primary", height=30).pack(
             side="right", padx=(0, SPACE["sm"])
         )
 
@@ -1740,9 +1381,9 @@ class App(tk.Tk):
             lines.append(f"目标卡：{self._provider_label()}")
         lines.append(f"模型：{len(body['models'])} 个")
         if body["mode"] == "list" and body["app"] in ("opencode", "codex"):
-            lines.append(f"上下文：{_fmt_ctx(body['context'])}")
+            lines.append(f"上下文：{fmt_ctx(body['context'])}")
         if body["mode"] == "list" and body["app"] == "opencode":
-            lines.append(f"最大输出：{_fmt_ctx(body['output'])}")
+            lines.append(f"最大输出：{fmt_ctx(body['output'])}")
         lines.append("")
         lines.append("写入前会自动备份，可用「回滚到备份」还原。")
         return "\n".join(lines)
@@ -1767,7 +1408,7 @@ class App(tk.Tk):
             self._set_busy(False)
             self.apply_btn.set_text("写入并备份")
 
-        self._work(lambda: _apply(body), done, failed)
+        self._work(lambda: apply_payload(body), done, failed)
 
     def _after_apply(self, result: dict) -> None:
         self.logln("写入成功：" + result.get("summary", ""), "ok")
@@ -1781,7 +1422,7 @@ class App(tk.Tk):
             backups.append((str(result["backup"]), target))
         if backups:
             self.last_backups = backups
-            labels = [path.replace("\\", "/").rsplit("/", 1)[-1] for path, _t in backups]
+            labels = [_backup_label(path) for path, _t in backups]
             self.backup_lbl.configure(text="上次备份：" + "；".join(labels))
         self._update_action_state()
         self._refresh_status()
@@ -1795,7 +1436,10 @@ class App(tk.Tk):
     def do_rollback(self) -> None:
         if not self.last_backups:
             return
-        if not messagebox.askyesno("回滚", "回滚到上一次写入前的备份？", parent=self):
+        if self._cc_running:
+            messagebox.showwarning("回滚", "请先完全退出 CC Switch 再回滚", parent=self)
+            return
+        if not messagebox.askyesno("回滚", "回滚到上一次写入前的备份？\n当前状态会先另存一份备份。", parent=self):
             return
         backups = list(self.last_backups)
 
@@ -1803,7 +1447,10 @@ class App(tk.Tk):
             return [core.rollback(path, target) for path, target in backups]
 
         def done(result: list[dict]) -> None:
-            self.logln("已回滚：" + "；".join(item["restored"] for item in result), "ok")
+            message = "已回滚：" + "；".join(item["restored"] for item in result)
+            if any(item.get("backup") for item in result):
+                message += "；回滚前状态已另存备份"
+            self.logln(message, "ok")
             self.last_backups = []
             self.backup_lbl.configure(text="")
             self._update_action_state()
@@ -1813,6 +1460,7 @@ class App(tk.Tk):
     # ---------- 对话框 ----------
 
     def _dialog(self, title: str, width: int, height: int) -> tuple[tk.Toplevel, tk.Frame]:
+        self._prune_registry()
         win = tk.Toplevel(self)
         win.title(title)
         win.configure(bg=self.pal["bg"])
@@ -1888,7 +1536,9 @@ class App(tk.Tk):
             create_btn.set_enabled(False)
 
             def job() -> dict:
-                result = core.create_provider(app_var.get(), name, url, key_var.get().strip(), model=model_var.get().strip())
+                result = core.create_provider(
+                    app_var.get(), name, url, key_var.get().strip(), model=model_var.get().strip(),
+                )
                 result["summary"] = f"已新建 {result['app']} 卡「{result['name']}」"
                 return result
 
@@ -1896,10 +1546,9 @@ class App(tk.Tk):
                 self.logln("新建成功：" + result["summary"], "ok")
                 if result.get("backup"):
                     self.last_backups = [(str(result["backup"]), "db")]
-                    self.backup_lbl.configure(text="上次备份：" + str(result["backup"]).replace("\\", "/").rsplit("/", 1)[-1])
+                    self.backup_lbl.configure(text="上次备份：" + _backup_label(result["backup"]))
                 self.app.set(result["app"])
-                self.sync_mode()
-                self.after(400, lambda: self._select_provider(result["id"]))
+                self.sync_mode(select_provider=result["id"])
                 win.destroy()
                 self._update_action_state()
 
@@ -1991,7 +1640,6 @@ class App(tk.Tk):
             if not picked:
                 return
             ids = [str(r["id"]) for r in picked]
-            names = [str(r["name"]) for r in picked]
             delete_btn.set_enabled(False)
             delete_btn.set_text("删除中…")
 
@@ -2004,9 +1652,7 @@ class App(tk.Tk):
                 self.logln(result["summary"], "ok")
                 if result.get("backup"):
                     self.last_backups = [(str(result["backup"]), "db")]
-                    self.backup_lbl.configure(
-                        text="上次备份：" + str(result["backup"]).replace("\\", "/").rsplit("/", 1)[-1]
-                    )
+                    self.backup_lbl.configure(text="上次备份：" + _backup_label(result["backup"]))
                 self.load_providers()
                 win.destroy()
 
@@ -2028,207 +1674,8 @@ class App(tk.Tk):
         self.destroy()
 
 
-# ---------------------------------------------------------------- 预览文本
-
-
-def _models_from(body: dict) -> list[core.Model]:
-    out = []
-    for item in body.get("models") or []:
-        if isinstance(item, str):
-            out.append(core.Model(id=item))
-        else:
-            out.append(
-                core.Model(
-                    id=str(item.get("id") or ""),
-                    display_name=str(item.get("display_name") or ""),
-                    description=str(item.get("description") or ""),
-                    owned_by=str(item.get("owned_by") or ""),
-                    context=int(item.get("context") or 0),
-                    output=int(item.get("output") or 0),
-                    input_modalities=list(item.get("input_modalities") or []),
-                    reasoning_levels=list(item.get("reasoning_levels") or []),
-                    default_reasoning_level=str(item.get("default_reasoning_level") or ""),
-                )
-            )
-    return [m for m in out if m.id]
-
-
-def _model_lines(models: list[core.Model], limit: int = 12) -> list[str]:
-    lines = [f"  {n}. {m.id}" for n, m in enumerate(models[:limit], 1)]
-    if len(models) > limit:
-        lines.append(f"  … 其余 {len(models) - limit} 个")
-    return lines
-
-
-def _preview_summary(body: dict) -> str:
-    models = _models_from(body)
-    if not models:
-        raise ValueError("没有选择任何模型")
-    mode = body.get("mode", "list")
-    app = body.get("app", "claude")
-    context = int(body.get("context") or 0)
-    known = sum(1 for m in models if getattr(m, "context", 0))
-
-    if mode == "fanout":
-        template = core.get_provider(app, body.get("providerId"))
-        if not template:
-            raise ValueError("找不到模板卡")
-        cards = core.build_fanout_cards(
-            template, models, app_type=app,
-            endpoints=core.get_endpoints(app, body["providerId"]),
-            fill_roles=bool(body.get("fillRoles", True)),
-            name_prefix=str(body.get("namePrefix") or ""),
-        )
-        names = [card["name"] for card in cards]
-        lines = [
-            f"目标：以「{template['name']}」为模板，在 {app} 下新建 {len(names)} 张卡",
-            f"卡名前缀：{body.get('namePrefix') or '（无）'}",
-            f"角色槽位：{'同时填写 Sonnet / Opus / Haiku' if body.get('fillRoles', True) else '不填写'}",
-            "",
-            f"将新建的卡（{len(names)} 张）：",
-        ]
-        lines.extend(f"  {n}. {name}" for n, name in enumerate(names[:12], 1))
-        if len(names) > 12:
-            lines.append(f"  … 其余 {len(names) - 12} 张")
-        lines.extend(["", "写入前会自动备份数据库，可用「回滚到备份」还原。"])
-        return "\n".join(lines)
-
-    if mode == "list" and app == "opencode":
-        provider = core.get_provider("opencode", body.get("providerId"))
-        if not provider:
-            raise ValueError("找不到 OpenCode 供应商卡")
-        existing = json.loads(provider["settings_config"]).get("models") or {}
-        built = core.build_opencode_models(
-            models,
-            existing=existing if isinstance(existing, dict) else None,
-            merge=bool(body.get("merge")),
-            context=context or DEFAULT_CONTEXT,
-            output=int(body.get("output") or DEFAULT_OUTPUT),
-        )
-        action = "合并进" if body.get("merge") else "覆盖为"
-        note = (
-            f"接口返回值用于 {known} 个模型，其余使用手动值" if known else "接口未返回，全部使用手动值"
-        )
-        lines = [
-            f"目标：OpenCode 卡「{provider['name']}」的模型列表",
-            f"操作：{action} {len(built)} 个模型",
-            f"上下文：{_fmt_ctx(context or DEFAULT_CONTEXT)}（{note}）",
-            f"最大输出：{_fmt_ctx(int(body.get('output') or DEFAULT_OUTPUT))}",
-            "",
-            f"模型列表（{len(built)} 个，显示前 12 个）：",
-        ]
-        lines.extend(f"  {n}. {model_id}" for n, model_id in enumerate(list(built)[:12], 1))
-        if len(built) > 12:
-            lines.append(f"  … 其余 {len(built) - 12} 个")
-        lines.extend(["", "写入前会自动备份数据库，可用「回滚到备份」还原。"])
-        return "\n".join(lines)
-
-    if mode == "list" and app == "codex":
-        provider_id = body.get("providerId")
-        provider = core.get_provider("codex", provider_id) if provider_id else None
-        existing_card = None
-        if provider:
-            existing_card = json.loads(provider["settings_config"]).get("modelCatalog")
-        existing_catalog = json.loads(core.CODEX_CATALOG.read_text(encoding="utf-8")) if core.CODEX_CATALOG.exists() else None
-        template = None
-        if isinstance(existing_catalog, dict) and existing_catalog.get("models"):
-            template = existing_catalog["models"][0]
-        catalog = core.build_codex_catalog(
-            models, template, context=context, existing=existing_catalog, merge=bool(body.get("merge")),
-        )
-        card_catalog = (
-            core.build_codex_model_catalog(models, existing=existing_card, merge=bool(body.get("merge")))
-            if provider else None
-        )
-        base = existing_card if provider else existing_catalog
-        key = "model" if provider else "slug"
-        incoming = card_catalog if provider else core.build_codex_catalog(models, template, context=context)
-        _merged, stats = core.merge_json_entries(base, incoming, key=key, merge=bool(body.get("merge")))
-        action = "合并新增" if body.get("merge") else "覆盖写入"
-        lines = [
-            f"目标：{'Codex 卡「' + provider['name'] + '」和 ' if provider else ''}模型目录 {core.CODEX_CATALOG}",
-            f"操作：{action} {stats['added']} 个模型，保留 {stats['preserved']} 个",
-            f"上下文：{_fmt_ctx(context) or context}（接口给出 {known} 个）",
-            f"卡内模型：{len(card_catalog['models']) if card_catalog else 0} 个 · 目录模型：{len(catalog['models'])} 个",
-            "",
-            f"模型列表（{len(models)} 个，显示前 12 个）：",
-        ]
-        lines.extend(_model_lines(models))
-        lines.extend(["", "写入前会自动备份数据库与模型目录，可用「回滚到备份」还原。"])
-        return "\n".join(lines)
-
-    provider = core.get_provider("claude", body.get("providerId"))
-    if not provider:
-        raise ValueError("找不到 Claude 供应商卡")
-    picker = core.build_model_picker(models, bool(body.get("replaceBuiltIn", True)))
-    lines = [
-        f"目标：Claude 卡「{provider['name']}」的 modelPicker",
-        f"操作：写入 {len(picker['options'])} 行"
-        + ("，并覆盖内置模型列表" if bool(body.get("replaceBuiltIn", True)) else "，保留内置模型列表"),
-    ]
-    if body.get("gatewayDiscovery"):
-        lines.append("附加：开启 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1")
-    lines.extend(["", f"模型列表（{len(models)} 个，显示前 12 个）："])
-    lines.extend(_model_lines(models))
-    lines.extend(["", "写入前会自动备份数据库，可用「回滚到备份」还原。"])
-    return "\n".join(lines)
-
-
-def _apply(body: dict) -> dict:
-    models = _models_from(body)
-    if not models:
-        raise ValueError("没有选择任何模型")
-    mode = body.get("mode", "list")
-    app = body.get("app", "claude")
-    hot_codex = mode == "list" and app == "codex"
-    if core.cc_switch_running() and not hot_codex:
-        raise RuntimeError("CC Switch 正在运行，请先完全退出后再写入")
-
-    provider_id = body.get("providerId")
-
-    if mode == "fanout":
-        result = core.apply_fanout(
-            provider_id, models, app_type=app,
-            fill_roles=bool(body.get("fillRoles", True)),
-            name_prefix=str(body.get("namePrefix") or ""),
-        )
-        result["summary"] = f"已在 {result['app']} 下新建 {result['rows']} 张供应商卡"
-        return result
-
-    if app == "opencode":
-        result = core.apply_opencode(
-            provider_id, models, merge=bool(body.get("merge")),
-            context=int(body.get("context") or DEFAULT_CONTEXT),
-            output=int(body.get("output") or DEFAULT_OUTPUT),
-        )
-        result["summary"] = f"已把 {result['rows']} 个模型写入 OpenCode 卡「{result['provider']}」的模型列表"
-        return result
-
-    if app == "codex":
-        result = core.apply_codex(
-            models, provider_id,
-            context=int(body.get("context") or 0),
-            merge=bool(body.get("merge")),
-        )
-        action = "合并新增" if result["merged"] else "覆盖写入"
-        target = f"Codex 卡「{result['provider']}」和模型目录" if result.get("provider") else "Codex 模型目录"
-        result["summary"] = (
-            f"已{action} {result['added']} 个模型到{target}，保留 {result['preserved']} 个；"
-            f"共 {result['cardRows'] or result['catalogRows']} 个模型"
-        )
-        return result
-
-    result = core.apply_claude(
-        provider_id, models,
-        replace_builtin=bool(body.get("replaceBuiltIn", True)),
-        gateway_discovery=bool(body.get("gatewayDiscovery")),
-    )
-    result["summary"] = f"已把 {result['rows']} 个模型写入 Claude 卡「{result['provider']}」的 modelPicker"
-    return result
-
-
 def main() -> None:
-    _enable_dpi_awareness()
+    enable_dpi_awareness()
     App().mainloop()
 
 

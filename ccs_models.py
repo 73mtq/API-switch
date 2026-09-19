@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import getpass
+import io
 import json
 import os
 import re
@@ -17,21 +18,23 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 HOME = Path.home()
 CC_DIR = HOME / ".cc-switch"
-DB_PATH = CC_DIR / "cc-switch.db"
 BACKUP_DIR = CC_DIR / "backups"
 CODEX_DIR = HOME / ".codex"
-CODEX_CATALOG = CODEX_DIR / "cc-switch-model-catalog.json"
 
 if getattr(sys, "frozen", False):
     OUT_DIR = Path(sys.executable).resolve().parent / "out"
 else:
     OUT_DIR = Path(__file__).resolve().parent / "out"
+
+DB_PATH = Path(os.environ.get("CCS_DB_PATH") or (CC_DIR / "cc-switch.db"))
+CODEX_CATALOG = Path(os.environ.get("CCS_CATALOG_PATH") or (CODEX_DIR / "cc-switch-model-catalog.json"))
 
 KNOWN_COMPAT_SUFFIXES = [
     "/api/claudecode",
@@ -46,6 +49,12 @@ KNOWN_COMPAT_SUFFIXES = [
 ]
 
 PROCESS_NAMES = ["CC Switch.exe", "cc-switch.exe", "CC-Switch.exe", "cc-switch"]
+
+INSERT_PROVIDER_SQL = (
+    "INSERT INTO providers "
+    "(id, app_type, name, settings_config, category, created_at, sort_index, meta, is_current, in_failover_queue) "
+    "VALUES (?,?,?,?,?,?,?,?,0,0)"
+)
 
 
 @dataclass
@@ -117,7 +126,9 @@ def build_candidates(base_url: str, is_full_url: bool = False, override: str | N
             raise ValueError("无法从完整 URL 推导模型列表地址")
         return _dedupe(candidates)
 
-    if ends_with_version_segment(trimmed):
+    if trimmed.endswith("/models"):
+        candidates.append(trimmed)
+    elif ends_with_version_segment(trimmed):
         candidates.append(trimmed + "/models")
         if not trimmed.endswith("/v1"):
             candidates.append(trimmed + "/v1/models")
@@ -244,7 +255,6 @@ def parse_models_response(payload: Any) -> list[Model]:
                 ),
             )
         )
-    models.sort(key=lambda m: m.id)
     return models
 
 
@@ -308,17 +318,17 @@ def fetch_models(
             if status in (404, 405):
                 last_error = msg
                 continue
-            raise RuntimeError(f"{target} 请求失败：{msg}")
+            raise RuntimeError(f"{target} 请求失败：{msg}") from exc
         except Exception as exc:
             msg = f"请求失败：{exc}"
             logs.append(f"  → {msg}")
             log(logs[-1])
-            raise RuntimeError(f"{target} {msg}")
+            raise RuntimeError(f"{target} {msg}") from exc
 
         try:
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"{target} 返回内容不是 JSON：{exc}\n前 200 字符：{body[:200]}")
+            raise RuntimeError(f"{target} 返回内容不是 JSON：{exc}\n前 200 字符：{body[:200]}") from exc
 
         models = parse_models_response(payload)
         logs.append(f"  → 200，解析到 {len(models)} 个模型")
@@ -408,18 +418,31 @@ def cc_switch_running() -> bool:
         return False
 
 
+def _stamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+
+
+def _unique_path(target: Path) -> Path:
+    if not target.exists():
+        return target
+    index = 1
+    while True:
+        candidate = target.with_name(f"{target.name}-{index}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 def backup_file(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    target = path.parent / f"{path.name}.bak-{stamp}"
+    target = _unique_path(path.parent / f"{path.name}.bak-{_stamp()}")
     shutil.copy2(path, target)
     return target
 
 
 def backup_db(db_path: Path = DB_PATH) -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    target = BACKUP_DIR / f"cc-switch.db.bak-{stamp}"
+    target = _unique_path(BACKUP_DIR / f"cc-switch.db.bak-{_stamp()}")
     src = open_ro(db_path)
     dst = sqlite3.connect(str(target))
     try:
@@ -755,9 +778,7 @@ def create_provider(
                 "SELECT COALESCE(MAX(sort_index), 0) AS m FROM providers WHERE app_type=?", (app_type,)
             ).fetchone()
             conn.execute(
-                "INSERT INTO providers "
-                "(id, app_type, name, settings_config, category, created_at, sort_index, meta, is_current, in_failover_queue) "
-                "VALUES (?,?,?,?,?,?,?,?,0,0)",
+                INSERT_PROVIDER_SQL,
                 (
                     pid, app_type, name, json.dumps(settings, ensure_ascii=False),
                     "custom", now, int(row["m"] or 0) + 1, json.dumps(meta, ensure_ascii=False),
@@ -860,10 +881,11 @@ def apply_codex(
         if not provider:
             raise ValueError(f"找不到 Codex 供应商卡：{provider_id}")
         try:
-            config = json.loads(provider["settings_config"] or "{}")
+            card_config = json.loads(provider["settings_config"] or "{}")
         except json.JSONDecodeError as exc:
             raise ValueError(f"Codex 供应商卡配置不是有效 JSON：{exc}") from exc
-        existing_card = config.get("modelCatalog")
+        config = card_config
+        existing_card = card_config.get("modelCatalog")
 
     catalog = build_codex_catalog(
         models,
@@ -1013,9 +1035,7 @@ def apply_fanout(
             sort_base = int(row["m"] or 0)
             for i, card in enumerate(cards):
                 conn.execute(
-                    "INSERT INTO providers "
-                    "(id, app_type, name, settings_config, category, created_at, sort_index, meta, is_current, in_failover_queue) "
-                    "VALUES (?,?,?,?,?,?,?,?,0,0)",
+                    INSERT_PROVIDER_SQL,
                     (
                         card["id"],
                         card["app_type"],
@@ -1052,19 +1072,26 @@ def rollback(backup_path: str | None, target: str = "db") -> dict[str, Any]:
     src = Path(backup_path)
     if not src.exists():
         raise FileNotFoundError(f"备份不存在：{backup_path}")
-    dst = DB_PATH if target == "db" else CODEX_CATALOG
+    if target == "db":
+        dst = DB_PATH
+        safety = backup_db(dst) if dst.exists() else None
+    else:
+        dst = CODEX_CATALOG
+        safety = backup_file(dst) if dst.exists() else None
     shutil.copy2(src, dst)
-    return {"ok": True, "restored": str(dst), "from": str(src)}
+    return {
+        "ok": True,
+        "restored": str(dst),
+        "from": str(src),
+        "backup": str(safety) if safety else None,
+    }
 
 
 def save_models(models: list[Model], out_dir: Path = OUT_DIR) -> tuple[Path, Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
     js = out_dir / "models.json"
     txt = out_dir / "models.txt"
-    js.write_text(
-        json.dumps([m.to_dict() for m in models], ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    txt.write_text("\n".join(m.id for m in models) + "\n", encoding="utf-8")
+    write_text_atomic(js, json.dumps([m.to_dict() for m in models], ensure_ascii=False, indent=2))
+    write_text_atomic(txt, "\n".join(m.id for m in models) + "\n")
     return js, txt
 
 
@@ -1142,6 +1169,9 @@ def cmd_apply(args: argparse.Namespace) -> int:
         print(json.dumps(build_model_picker(chosen), ensure_ascii=False, indent=2))
         return 0
 
+    if args.mode != "codex" and not args.force and cc_switch_running():
+        raise RuntimeError("CC Switch 正在运行，请先完全退出后再写入（--force 可跳过检查）")
+
     if args.mode == "claude":
         res = apply_claude(args.provider, chosen, replace_builtin=not args.append, gateway_discovery=args.discovery)
     elif args.mode == "opencode":
@@ -1194,6 +1224,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--merge", action="store_true", help="OpenCode / Codex：合并到已有模型列表")
     a.add_argument("--discovery", action="store_true", help="同时开启网关模型发现")
     a.add_argument("--no-fill-roles", action="store_true")
+    a.add_argument("--force", action="store_true", help="跳过 CC Switch 运行检查（Codex 模式本来就允许运行中写入）")
     a.add_argument("--dry-run", action="store_true")
     a.set_defaults(func=cmd_apply)
 
@@ -1215,10 +1246,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    try:
+    if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
     args = build_parser().parse_args(argv)
     return args.func(args)
 
